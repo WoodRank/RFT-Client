@@ -3,6 +3,7 @@
 //
 #include <iostream>
 #include <fstream>
+#include <string>
 #include <sys/socket.h>
 #include <system_error>
 #include <unistd.h>
@@ -70,12 +71,24 @@ int main(int argc, char* argv[]) {
     // * Open the input file
     // *********************************
 
+
+    std::ifstream inputFile(inputFilename, std::ios::binary);
+   if (!inputFile) {
+            throw std::runtime_error("Could not open input file: " + inputFilename);
+    }
+
+
     try {
 
         // ***************************************************************
         // * Initialize your timer, window and the unreliableTransport etc.
         // **************************************************************
+        timerC timer(50); //Set duration to 50 milliseconds
+        unreliableTransportC transportInstance{hostname, portNum};
 
+        std::array<datagramS, WINDOW_SIZE> sendPacket;
+        int base = 1;
+        int nextSeqNum = 1;
 
         // ***************************************************************
         // * Send the file one datagram at a time until they have all been
@@ -83,17 +96,88 @@ int main(int argc, char* argv[]) {
         // **************************************************************
         bool allSent(false);
         bool allAcked(false);
+
+        bool finalPacketHasBeenSent(false);
+
+        // Using your original while condition
         while ((!allSent) && (!allAcked)) {
 	
-		// Is there space in the window? If so, read some data from the file and send it.
+		    // Is there space in the window?
+            if (nextSeqNum < base + WINDOW_SIZE){
+                
+                // Only try to read from the file if we haven't sent the final packet yet.
+                if (!finalPacketHasBeenSent) {
+                    datagramS packet;
+                    packet.seqNum = nextSeqNum;
 
-                // Call udt_recieve() to see if there is an acknowledgment.  If there is, process it.
- 
-                // Check to see if the timer has expired.
+                    inputFile.read(packet.data, MAX_PAYLOAD_LENGTH);
+                    packet.payloadLength = inputFile.gcount(); 
 
+                    if (packet.payloadLength > 0){
+                        // This is a regular data packet
+                        packet.checksum = computeChecksum(packet);
+                        sendPacket[nextSeqNum % WINDOW_SIZE] = packet;
+                        transportInstance.udt_send(packet);
+
+                        if (base == nextSeqNum){
+                            timer.start();
+                        }
+                        nextSeqNum++;
+                    } else {
+                        // End of file is reached. Send the final packet.
+                        packet.payloadLength = 0; // Set payload to 0
+                        packet.checksum = computeChecksum(packet);
+                        sendPacket[nextSeqNum % WINDOW_SIZE] = packet;
+                        transportInstance.udt_send(packet);
+
+                        if (base == nextSeqNum) {
+                            timer.start();
+                        }
+                        nextSeqNum++;
+                        
+                        // Set our new internal flag. We DO NOT set allSent here.
+                        finalPacketHasBeenSent = true; 
+                    }
+                }
+            }
+
+            // Call udt_recieve() to see if there is an acknowledgment.
+            datagramS ackPacket;
+            if (transportInstance.udt_receive(ackPacket) > 0){
+                DEBUG << "Calling udt_receive if there is an acknowledgment" << ENDL;
+                if (validateChecksum(ackPacket)){
+                    base = ackPacket.ackNum + 1;
+                    if (base == nextSeqNum){
+                        timer.stop();
+                        
+                        // Check if the final packet has been sent. If so, the transfer is complete.
+                        if (finalPacketHasBeenSent){
+                            DEBUG << "Final packet has been set" <<ENDL;
+                            // Now we set both flags, which will cause the loop to exit.
+                            allSent = true;
+                            allAcked = true;
+                        }
+                    } else {
+                        timer.start();
+                    }
+                }
+            }
+        
+            // Check to see if the timer has expired.
+            DEBUG <<"Checking to see timer expired" << ENDL;
+            if (timer.timeout()){
+                DEBUG << "Timer Ran out! Sending packet from window again." << ENDL;
+                timer.start();
+
+                for (uint16_t i = base; i < nextSeqNum; i++){
+                    transportInstance.udt_send(sendPacket[i % WINDOW_SIZE]);
+                }
+            }
         }
 
         // cleanup and close the file and network.
+        inputFile.close();
+        
 
     } catch (std::exception &e) {
         FATAL<< "Error: " << e.what() << ENDL;
